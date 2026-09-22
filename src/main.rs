@@ -195,10 +195,9 @@ impl WorkshopDlApp {
                     }
                 }
             }
-            let message = if failures == 0 {
-                "Descarga completada.".to_owned()
-            } else {
-                format!("Descarga terminada con {failures} fallo(s).")
+            let message = match failures == 0 {
+                true => "Descarga completada.".to_owned(),
+                false => format!("Descarga terminada con {failures} fallo(s)."),
             };
             let _ = sender.send(DownloadMessage::Finished {
                 success: failures == 0,
@@ -208,7 +207,7 @@ impl WorkshopDlApp {
     }
 
     fn poll_download(&mut self) {
-        let mut finished = None;
+        let mut finished: Option<(bool, String)> = None;
         if let Some(receiver) = &self.receiver {
             loop {
                 match receiver.try_recv() {
@@ -233,10 +232,9 @@ impl WorkshopDlApp {
                         .push(format!("No se pudo abrir la carpeta de destino: {error}")),
                 }
             }
-            self.status = if success {
-                message
-            } else {
-                format!("Error: {message}")
+            self.status = match success {
+                true => message,
+                false => format!("Error: {message}"),
             };
         }
     }
