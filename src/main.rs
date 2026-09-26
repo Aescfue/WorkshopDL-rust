@@ -15,6 +15,12 @@ struct ModItem {
     workshop_id: String,
 }
 
+#[derive(Clone)]
+struct SteamCredentials {
+    username: String,
+    password: String,
+}
+
 enum DownloadMessage {
     Log(String),
     AppId(String),
@@ -29,12 +35,24 @@ struct WorkshopDlApp {
     receiver: Option<Receiver<DownloadMessage>>,
     downloading: bool,
     open_folder_after_download: bool,
+    settings_open: bool,
+    steam_username: String,
+    steam_password: String,
+    remember_steam_credentials: bool,
+    credentials_notice: String,
     status: String,
     log: Vec<String>,
 }
 
 impl Default for WorkshopDlApp {
     fn default() -> Self {
+        let (saved_credentials, credentials_notice) = match load_saved_credentials() {
+            Ok(credentials) => (credentials, String::new()),
+            Err(error) => (
+                None,
+                format!("No se pudieron leer las credenciales guardadas: {error}"),
+            ),
+        };
         Self {
             app_id_input: String::new(),
             workshop_id_input: String::new(),
@@ -43,6 +61,15 @@ impl Default for WorkshopDlApp {
             receiver: None,
             downloading: false,
             open_folder_after_download: false,
+            settings_open: false,
+            steam_username: saved_credentials
+                .as_ref()
+                .map_or_else(String::new, |credentials| credentials.username.clone()),
+            steam_password: saved_credentials
+                .as_ref()
+                .map_or_else(String::new, |credentials| credentials.password.clone()),
+            remember_steam_credentials: saved_credentials.is_some(),
+            credentials_notice,
             status: "Listo para descargar".to_owned(),
             log: vec!["WorkshopDL Rust iniciado. Solo se usara SteamCMD.".to_owned()],
         }
@@ -115,6 +142,23 @@ impl WorkshopDlApp {
         if self.downloading {
             return;
         }
+        if self.steam_username.is_empty() != self.steam_password.is_empty() {
+            self.status = "Completa usuario y contrasena de Steam, o deja ambos vacios.".to_owned();
+            return;
+        }
+        if self
+            .steam_username
+            .chars()
+            .chain(self.steam_password.chars())
+            .any(|character| matches!(character, '\r' | '\n' | '\0'))
+        {
+            self.status = "Las credenciales contienen caracteres no admitidos.".to_owned();
+            return;
+        }
+        let credentials = (!self.steam_username.is_empty()).then(|| SteamCredentials {
+            username: self.steam_username.clone(),
+            password: self.steam_password.clone(),
+        });
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
         self.downloading = true;
@@ -170,13 +214,23 @@ impl WorkshopDlApp {
             if !resolved_items.is_empty() {
                 let mut command = Command::new(&executable);
                 command.current_dir(executable.parent().unwrap_or(std::path::Path::new(".")));
-                command.args(["+login", "anonymous"]);
+                match &credentials {
+                    Some(credentials) => {
+                        let _ = sender.send(DownloadMessage::Log(
+                            "Iniciando sesion con cuenta Steam.".to_owned(),
+                        ));
+                        command.args(["+login", &credentials.username, &credentials.password]);
+                    }
+                    None => {
+                        command.args(["+login", "anonymous"]);
+                    }
+                }
                 for item in &resolved_items {
                     command.args(["+workshop_download_item", &item.app_id, &item.workshop_id]);
                 }
                 command.arg("+quit");
                 hide_console_window(&mut command);
-                match run_steamcmd(&mut command, &sender) {
+                match run_steamcmd(&mut command, &sender, credentials.as_ref()) {
                     Ok(status) if status.success() => {}
                     Ok(status) => {
                         failures += resolved_items.len();
@@ -204,6 +258,51 @@ impl WorkshopDlApp {
                 message,
             });
         });
+    }
+
+    fn save_steam_credentials(&mut self) {
+        if self.steam_username.is_empty() != self.steam_password.is_empty() {
+            self.credentials_notice = "Debes completar ambos campos o dejarlos vacios.".to_owned();
+            return;
+        }
+        if !self.steam_username.is_empty()
+            && (self.steam_username.contains(['\r', '\n', '\0'])
+                || self.steam_password.contains(['\r', '\n', '\0']))
+        {
+            self.credentials_notice =
+                "Las credenciales contienen caracteres no admitidos.".to_owned();
+            return;
+        }
+        let result = if self.remember_steam_credentials && !self.steam_username.is_empty() {
+            save_credentials_secure(&SteamCredentials {
+                username: self.steam_username.clone(),
+                password: self.steam_password.clone(),
+            })
+        } else {
+            remove_saved_credentials()
+        };
+        self.credentials_notice = match result {
+            Ok(()) if self.remember_steam_credentials && !self.steam_username.is_empty() => {
+                "Credenciales cifradas y guardadas para esta cuenta de Windows.".to_owned()
+            }
+            Ok(()) => "No se guardaran credenciales en este equipo.".to_owned(),
+            Err(error) => format!("No se pudieron guardar las credenciales: {error}"),
+        };
+    }
+
+    fn forget_steam_credentials(&mut self) {
+        match remove_saved_credentials() {
+            Ok(()) => {
+                self.steam_username.clear();
+                self.steam_password.clear();
+                self.remember_steam_credentials = false;
+                self.credentials_notice = "Credenciales guardadas borradas.".to_owned();
+            }
+            Err(error) => {
+                self.credentials_notice =
+                    format!("No se pudieron borrar las credenciales: {error}");
+            }
+        }
     }
 
     fn poll_download(&mut self) {
@@ -249,7 +348,14 @@ impl eframe::App for WorkshopDlApp {
 
         egui::CentralPanel::default().show(context, |ui| {
             ui.add_space(8.0);
-            ui.heading("WorkshopDL Rust");
+            ui.horizontal(|ui| {
+                ui.heading("WorkshopDL Rust");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Herramientas").clicked() {
+                        self.settings_open = true;
+                    }
+                });
+            });
             ui.label("Descarga mods de Steam Workshop usando exclusivamente SteamCMD.");
             ui.add_space(16.0);
             ui.checkbox(
@@ -330,16 +436,65 @@ impl eframe::App for WorkshopDlApp {
                         ui.ctx().copy_text(self.log.join("\n"));
                     }
                 });
-                let mut activity = self.log.join("\n");
-                ui.add_sized(
-                    [ui.available_width(), 220.0],
-                    egui::TextEdit::multiline(&mut activity)
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(12),
+                let log_width = ui.available_width();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(log_width, 220.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for line in &self.log {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(line)
+                                                .monospace()
+                                                .text_style(egui::TextStyle::Monospace),
+                                        )
+                                        .selectable(true),
+                                    );
+                                }
+                            });
+                    },
                 );
             });
         });
+
+        if self.settings_open {
+            let mut settings_open = self.settings_open;
+            egui::Window::new("Cuenta Steam")
+                .open(&mut settings_open)
+                .resizable(false)
+                .show(context, |ui| {
+                    ui.label("Credenciales usadas por SteamCMD para las descargas.");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.steam_username)
+                            .hint_text("Nombre de usuario de Steam"),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.steam_password)
+                            .password(true)
+                            .hint_text("Contrasena"),
+                    );
+                    ui.checkbox(
+                        &mut self.remember_steam_credentials,
+                        "Guardar cifradas con la proteccion de Windows",
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Guardar").clicked() {
+                            self.save_steam_credentials();
+                        }
+                        if ui.button("Borrar credenciales guardadas").clicked() {
+                            self.forget_steam_credentials();
+                        }
+                    });
+                    if !self.credentials_notice.is_empty() {
+                        ui.label(&self.credentials_notice);
+                    }
+                    ui.weak("DPAPI protege el archivo frente a lectura desde otra cuenta o equipo. Malware ejecutado como tu usuario puede acceder a la cuenta mientras la aplicacion la usa.");
+                });
+            self.settings_open = settings_open;
+        }
     }
 }
 
@@ -427,6 +582,145 @@ fn steamcmd_dir() -> PathBuf {
         })
         .join("WorkshopDL")
         .join("steamcmd")
+}
+
+fn credentials_file() -> PathBuf {
+    steamcmd_dir()
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("steam_credentials.bin")
+}
+
+fn load_saved_credentials() -> io::Result<Option<SteamCredentials>> {
+    let path = credentials_file();
+    let encrypted = match fs::read(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let plaintext = dpapi_unprotect(&encrypted)?;
+    let value: serde_json::Value = serde_json::from_slice(&plaintext)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let username = value["username"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "falta el usuario de Steam"))?;
+    let password = value["password"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "falta la contrasena de Steam")
+        })?;
+    Ok(Some(SteamCredentials {
+        username: username.to_owned(),
+        password: password.to_owned(),
+    }))
+}
+
+fn save_credentials_secure(credentials: &SteamCredentials) -> io::Result<()> {
+    let plaintext = serde_json::to_vec(&serde_json::json!({
+        "username": credentials.username,
+        "password": credentials.password,
+    }))
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let encrypted = dpapi_protect(&plaintext)?;
+    let path = credentials_file();
+    let parent = path.parent().unwrap_or(std::path::Path::new("."));
+    fs::create_dir_all(parent)?;
+    fs::write(path, encrypted)
+}
+
+fn remove_saved_credentials() -> io::Result<()> {
+    let path = credentials_file();
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn dpapi_protect(data: &[u8]) -> io::Result<Vec<u8>> {
+    use windows_sys::Win32::Foundation::{FALSE, LocalFree};
+    use windows_sys::Win32::Security::Cryptography::{
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData,
+    };
+
+    let length = u32::try_from(data.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "datos demasiado grandes"))?;
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: length,
+        pbData: data.as_ptr().cast_mut(),
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    let success = unsafe {
+        CryptProtectData(
+            &input,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if success == FALSE || output.pbData.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let encrypted =
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    unsafe { LocalFree(output.pbData.cast()) };
+    Ok(encrypted)
+}
+
+#[cfg(windows)]
+fn dpapi_unprotect(data: &[u8]) -> io::Result<Vec<u8>> {
+    use windows_sys::Win32::Foundation::{FALSE, LocalFree};
+    use windows_sys::Win32::Security::Cryptography::{
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptUnprotectData,
+    };
+
+    let length = u32::try_from(data.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "datos demasiado grandes"))?;
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: length,
+        pbData: data.as_ptr().cast_mut(),
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    let success = unsafe {
+        CryptUnprotectData(
+            &input,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if success == FALSE || output.pbData.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let plaintext =
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    unsafe { LocalFree(output.pbData.cast()) };
+    Ok(plaintext)
+}
+
+#[cfg(not(windows))]
+fn dpapi_protect(_data: &[u8]) -> io::Result<Vec<u8>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "DPAPI solo esta disponible en Windows",
+    ))
+}
+
+#[cfg(not(windows))]
+fn dpapi_unprotect(_data: &[u8]) -> io::Result<Vec<u8>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "DPAPI solo esta disponible en Windows",
+    ))
 }
 
 fn destination_dir() -> PathBuf {
@@ -538,6 +832,7 @@ fn send_log(sender: &mpsc::Sender<DownloadMessage>, message: &str) {
 fn run_steamcmd(
     command: &mut Command,
     sender: &mpsc::Sender<DownloadMessage>,
+    credentials: Option<&SteamCredentials>,
 ) -> io::Result<std::process::ExitStatus> {
     let mut child = command
         .stdout(Stdio::piped())
@@ -545,19 +840,22 @@ fn run_steamcmd(
         .spawn()?;
     let stdout = child.stdout.take().expect("stdout configurado");
     let stderr = child.stderr.take().expect("stderr configurado");
+    let secrets = credentials.map(|value| (value.username.clone(), value.password.clone()));
     let output_sender = sender.clone();
+    let stdout_secrets = secrets.clone();
     let stdout_thread = thread::spawn(move || {
         for line in io::BufReader::new(stdout).lines().map_while(Result::ok) {
             if !line.trim().is_empty() {
-                send_log(&output_sender, &line);
+                send_steamcmd_log(&output_sender, &line, stdout_secrets.as_ref());
             }
         }
     });
     let error_sender = sender.clone();
+    let stderr_secrets = secrets;
     let stderr_thread = thread::spawn(move || {
         for line in io::BufReader::new(stderr).lines().map_while(Result::ok) {
             if !line.trim().is_empty() {
-                send_log(&error_sender, &line);
+                send_steamcmd_log(&error_sender, &line, stderr_secrets.as_ref());
             }
         }
     });
@@ -565,6 +863,34 @@ fn run_steamcmd(
     let _ = stdout_thread.join();
     let _ = stderr_thread.join();
     Ok(status)
+}
+
+fn send_steamcmd_log(
+    sender: &mpsc::Sender<DownloadMessage>,
+    line: &str,
+    secrets: Option<&(String, String)>,
+) {
+    let sanitized = secrets.map_or_else(
+        || line.to_owned(),
+        |(username, password)| {
+            line.replace(password, "[contrasena oculta]")
+                .replace(username, "[usuario Steam]")
+        },
+    );
+    send_log(sender, &sanitized);
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_round_trip_encrypts_and_restores_data() {
+        let original = b"WorkshopDL DPAPI test";
+        let encrypted = super::dpapi_protect(original).expect("DPAPI debe cifrar los datos");
+        assert_ne!(encrypted, original);
+        let restored = super::dpapi_unprotect(&encrypted).expect("DPAPI debe descifrar los datos");
+        assert_eq!(restored, original);
+    }
 }
 
 #[cfg(windows)]
